@@ -1,9 +1,10 @@
 # ==============================================================================
 # Gait Analysis from MediaPipe 2D Pose Estimation
-# Version: 4.0.0
+# Version: 5.0.0
 #
 # Converted from OpenPose-based gait_analysis_local_batch_v3.15.py
-# - Input: MediaPipe landmark JSON files
+# - Input: MediaPipe landmark JSON files (pose-based, normalized to video resolution)
+# - Coordinates: x,y in [0,1] normalized to frame width/height; y=0 is top, y=1 is bottom
 # - Single video processing with CLI arguments
 # - Output: JSON (gait cycles + landmark passthrough) and analysis plots
 # ==============================================================================
@@ -18,6 +19,11 @@ from scipy.signal import savgol_filter, find_peaks
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 # ==============================================================================
 # --- 1. MediaPipe Landmark Definitions & Keypoint Mapping ---
@@ -60,9 +66,13 @@ MAJOR_KEYPOINTS_TO_TRACK = [
 # --- 2. Default Configuration ---
 # ==============================================================================
 CONFIDENCE_THRESHOLD = 0.3
-WALKING_VELOCITY_THRESHOLD = 0.0005
+# Walking velocity threshold for MidHip x-position displacement per frame.
+# Derived from original pixel threshold (2.0px) normalized by typical frame width (~1920px).
+WALKING_VELOCITY_THRESHOLD = 0.001
 TURN_EXCLUSION_WINDOW_FRAMES = 20
-DISCONTINUITY_ACCEL_THRESHOLD = 0.003
+# Acceleration threshold for detecting left/right label discontinuities.
+# Derived from original pixel threshold (15.0px) normalized by typical frame width (~1920px).
+DISCONTINUITY_ACCEL_THRESHOLD = 0.008
 KEYPOINTS_TO_SWAP = ['Hip', 'Knee', 'Ankle', 'Heel']
 
 # Rhythmic Template Matching parameters
@@ -116,6 +126,14 @@ def parse_args():
         '--velocity-threshold', type=float, default=WALKING_VELOCITY_THRESHOLD,
         help=f'Walking velocity threshold (default: {WALKING_VELOCITY_THRESHOLD})'
     )
+    parser.add_argument(
+        '--screenshot-heel-strikes', action='store_true', default=False,
+        help='Save video frames at detected heel strike moments as PNG images'
+    )
+    parser.add_argument(
+        '--video-file', type=str, default=None,
+        help='Path to source video file (required when --screenshot-heel-strikes is enabled)'
+    )
     return parser.parse_args()
 
 # ==============================================================================
@@ -126,6 +144,11 @@ def load_mediapipe_json(json_path):
     Load a MediaPipe landmarks JSON file and return:
       - DataFrame with columns matching the v3.15 analysis pipeline schema
       - Raw landmarks_data list for passthrough into output
+
+    Expects pose-based landmarks normalized to video resolution:
+      x in [0,1] (horizontal, left-to-right)
+      y in [0,1] (vertical, 0=top, 1=bottom)
+      Null landmarks are handled as NaN with confidence 0.0.
     """
     with open(json_path, 'r') as f:
         data = json.load(f)
@@ -167,22 +190,40 @@ def load_mediapipe_json(json_path):
 
         # Extract direct-mapped keypoints
         for internal_name, mp_idx in MP_TO_INTERNAL.items():
-            coords = pose[mp_idx]
-            row[f'{internal_name}_x'] = coords[0]
-            row[f'{internal_name}_y'] = coords[1]
-            row[f'{internal_name}_conf'] = 1.0
+            landmark = pose[mp_idx]
+            if landmark is None or (hasattr(landmark, '__iter__') and any(v is None for v in landmark)):
+                row[f'{internal_name}_x'] = np.nan
+                row[f'{internal_name}_y'] = np.nan
+                row[f'{internal_name}_conf'] = 0.0
+            else:
+                row[f'{internal_name}_x'] = landmark[0]
+                row[f'{internal_name}_y'] = landmark[1]
+                row[f'{internal_name}_conf'] = 1.0
 
         # Compute synthetic keypoints (Neck, MidHip)
         for internal_name, (idx_a, idx_b) in COMPUTED_KEYPOINTS.items():
             a, b = pose[idx_a], pose[idx_b]
-            row[f'{internal_name}_x'] = (a[0] + b[0]) / 2.0
-            row[f'{internal_name}_y'] = (a[1] + b[1]) / 2.0
-            row[f'{internal_name}_conf'] = 1.0
+            if a is None or b is None:
+                row[f'{internal_name}_x'] = np.nan
+                row[f'{internal_name}_y'] = np.nan
+                row[f'{internal_name}_conf'] = 0.0
+            else:
+                row[f'{internal_name}_x'] = (a[0] + b[0]) / 2.0
+                row[f'{internal_name}_y'] = (a[1] + b[1]) / 2.0
+                row[f'{internal_name}_conf'] = 1.0
 
         # Center point = average of Neck and MidHip
-        row['x'] = (row['Neck_x'] + row['MidHip_x']) / 2.0
-        row['y'] = (row['Neck_y'] + row['MidHip_y']) / 2.0
-        row['confidence'] = 1.0
+        neck_x, midhip_x = row.get('Neck_x'), row.get('MidHip_x')
+        neck_y, midhip_y = row.get('Neck_y'), row.get('MidHip_y')
+        if (neck_x is not None and midhip_x is not None
+                and not (np.isnan(neck_x) or np.isnan(midhip_x))):
+            row['x'] = (neck_x + midhip_x) / 2.0
+            row['y'] = (neck_y + midhip_y) / 2.0
+            row['confidence'] = 1.0
+        else:
+            row['x'] = np.nan
+            row['y'] = np.nan
+            row['confidence'] = 0.0
 
         rows.append(row)
 
@@ -315,6 +356,12 @@ def get_analysis_exclusion_zones(df, turn_frames, velocity_threshold, turn_windo
 
 
 def create_composite_signal(df, side):
+    """
+    Create a normalized composite signal from hip, knee, ankle, and heel y-coordinates.
+
+    In pose-based coordinates (y=0 top, y=1 bottom), peaks in this signal correspond
+    to the foot being at its lowest point in the image (i.e., on the ground = heel strike).
+    """
     hip_col = f'{side}Hip_y_smoothed'
     knee_col = f'{side}Knee_y_smoothed'
     ankle_col = f'{side}Ankle_y_smoothed'
@@ -403,9 +450,9 @@ def find_best_gait_pattern_iterative(segment_df, l_comp_sig, r_comp_sig, directi
                             if pd.isna(l_heel_x) or pd.isna(r_heel_x):
                                 is_valid_pattern = False
                                 break
-                            # Soft direction check: penalize but don't reject
-                            # In world coordinates (side view), heel x differences
-                            # can be small, so use a penalty instead of hard rejection
+                            # Soft direction check: penalize but don't reject.
+                            # In pose-based coords, x increases left-to-right (same as world coords),
+                            # so the heel x-position validation logic is unchanged.
                             is_correct_pos = False
                             if strike['side'] == 'L':
                                 if ((direction == 'L_to_R' and l_heel_x > r_heel_x) or
@@ -438,11 +485,11 @@ def find_best_gait_pattern_iterative(segment_df, l_comp_sig, r_comp_sig, directi
 # ==============================================================================
 # --- 6. Gait Cycle Construction ---
 # ==============================================================================
-def build_gait_cycles(left_strikes, right_strikes, exclusion_frames):
+def build_gait_cycles(left_strikes, right_strikes, exclusion_frames, strike_direction):
     """
     Convert heel strike lists into full gait cycles (same foot to same foot).
     Only pairs consecutive strikes that don't span an excluded zone (turn/inactive).
-    Each cycle is {start, end, side}.
+    Each cycle is {start, end, side, direction}.
     """
     cycles = []
     sorted_l = sorted(left_strikes)
@@ -453,9 +500,68 @@ def build_gait_cycles(left_strikes, right_strikes, exclusion_frames):
             # Skip cycles that cross excluded zones
             if any(f in exclusion_frames for f in range(start, end + 1)):
                 continue
-            cycles.append({'start': int(start), 'end': int(end), 'side': side})
+            cycles.append({
+                'start': int(start),
+                'end': int(end),
+                'side': side,
+                'direction': strike_direction.get(start, 'unknown')
+            })
     cycles.sort(key=lambda c: c['start'])
     return cycles
+
+# ==============================================================================
+# --- 6b. Heel Strike Screenshot Extraction ---
+# ==============================================================================
+def screenshot_heel_strikes(video_path, left_strikes, right_strikes, output_dir):
+    """
+    Extract video frames at detected heel strike moments and save as PNG images.
+
+    Args:
+        video_path: Path to the source video file
+        left_strikes: List of frame numbers for left heel strikes
+        right_strikes: List of frame numbers for right heel strikes
+        output_dir: Base output directory (screenshots go into heel_strike_screenshots/ subfolder)
+
+    Returns:
+        List of saved screenshot file paths
+    """
+    print("\n--- Extracting Heel Strike Screenshots ---")
+
+    screenshot_dir = os.path.join(output_dir, 'heel_strike_screenshots')
+    os.makedirs(screenshot_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"  ERROR: Could not open video file: {video_path}")
+        return []
+
+    total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"  Video: {video_path} ({total_video_frames} frames)")
+
+    # Combine all strikes with side labels, sorted by frame number
+    all_strikes = [(f, 'L') for f in left_strikes] + [(f, 'R') for f in right_strikes]
+    all_strikes.sort(key=lambda x: x[0])
+
+    saved_paths = []
+    for frame_num, side in all_strikes:
+        if frame_num >= total_video_frames:
+            print(f"  Warning: Frame {frame_num} exceeds video length ({total_video_frames}), skipping.")
+            continue
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        ret, frame = cap.read()
+        if not ret:
+            print(f"  Warning: Could not read frame {frame_num}, skipping.")
+            continue
+
+        filename = f'heel_strike_{side}_frame_{frame_num}.png'
+        filepath = os.path.join(screenshot_dir, filename)
+        cv2.imwrite(filepath, frame)
+        saved_paths.append(filepath)
+
+    cap.release()
+    print(f"  Saved {len(saved_paths)} heel strike screenshots to: {screenshot_dir}")
+    return saved_paths
 
 # ==============================================================================
 # --- 7. Plot Generation ---
@@ -588,7 +694,7 @@ def generate_plots(df_for_analysis, cleaned_df, exclusion_frames, final_l_strike
 # --- 8. Main Analysis Function ---
 # ==============================================================================
 def process_video(raw_df, landmarks_data, subject_id, output_dir, fps, args):
-    print(f"--- MediaPipe Gait Analysis (v4.0.0) ---")
+    print(f"--- MediaPipe Gait Analysis (v5.0.0) ---")
     print(f"--- Subject: {subject_id} ---")
     print(f"--- Frames: {len(raw_df)}, FPS: {fps} ---\n")
 
@@ -627,6 +733,7 @@ def process_video(raw_df, landmarks_data, subject_id, output_dir, fps, args):
     gait_analysis_df = df_for_analysis[~df_for_analysis['frame'].isin(exclusion_frames)]
     final_l_strikes, final_r_strikes = [], []
     all_l_peaks, all_r_peaks = [], []
+    strike_direction = {}
 
     clean_segments = gait_analysis_df.groupby(
         (gait_analysis_df['frame'].diff() > 1).cumsum()
@@ -656,6 +763,8 @@ def process_video(raw_df, landmarks_data, subject_id, output_dir, fps, args):
             segment, l_comp_sig, r_comp_sig, direction, prominence
         )
 
+        for frame_num, side in best_pattern:
+            strike_direction[frame_num] = direction
         final_l_strikes.extend([s[0] for s in best_pattern if s[1] == 'L'])
         final_r_strikes.extend([s[0] for s in best_pattern if s[1] == 'R'])
         all_l_peaks.extend(l_p)
@@ -667,12 +776,20 @@ def process_video(raw_df, landmarks_data, subject_id, output_dir, fps, args):
     print(f"  Left Heel-Strikes:  {len(final_l_strikes)} at frames {final_l_strikes}")
     print(f"  Right Heel-Strikes: {len(final_r_strikes)} at frames {final_r_strikes}")
 
+    # Step 4b: Screenshot heel strikes (if requested)
+    if args.screenshot_heel_strikes:
+        screenshot_heel_strikes(
+            args.video_file, final_l_strikes, final_r_strikes, output_dir
+        )
+
     # Step 5: Build gait cycles
-    gait_cycles = build_gait_cycles(final_l_strikes, final_r_strikes, exclusion_frames)
+    gait_cycles = build_gait_cycles(
+        final_l_strikes, final_r_strikes, exclusion_frames, strike_direction
+    )
     print(f"  Gait Cycles: {len(gait_cycles)}")
     for c in gait_cycles:
         duration = (c['end'] - c['start']) / fps
-        print(f"    {c['side']}: frame {c['start']} -> {c['end']} ({duration:.2f}s)")
+        print(f"    {c['side']} ({c['direction']}): frame {c['start']} -> {c['end']} ({duration:.2f}s)")
 
     # Step 6: Generate plots (if requested)
     if args.plots:
@@ -699,6 +816,19 @@ def process_video(raw_df, landmarks_data, subject_id, output_dir, fps, args):
 # ==============================================================================
 if __name__ == '__main__':
     args = parse_args()
+
+    # Validate screenshot arguments
+    if args.screenshot_heel_strikes:
+        if args.video_file is None:
+            print("ERROR: --video-file is required when --screenshot-heel-strikes is enabled.")
+            sys.exit(1)
+        if cv2 is None:
+            print("ERROR: opencv-python is required for --screenshot-heel-strikes. "
+                  "Install with: pip install opencv-python")
+            sys.exit(1)
+        if not os.path.isfile(args.video_file):
+            print(f"ERROR: Video file not found: {args.video_file}")
+            sys.exit(1)
 
     # Derive subject ID from filename if not provided
     subject_id = args.subject_id
