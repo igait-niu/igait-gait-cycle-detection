@@ -1,0 +1,76 @@
+#!/bin/bash
+#PBS -N iGait-Gait-Cycle-Detection
+#PBS -j oe
+#PBS -l select=1:ncpus=32:mpiprocs=1:ngpus=1:mem=32gb
+#PBS -l walltime=04:00:00
+#PBS -M z1989635@students.niu.edu
+#PBS -m abe
+
+# ============================================================
+# iGait Cycle Detection - PBS Batch Job
+# ============================================================
+# Expected input structure (flat layout):
+#   $INPUT_DIR/{subject_id}/{subject_id}_Side_landmarks.json
+#   $INPUT_DIR/{subject_id}/{subject_id}_Side_pose.mp4
+#
+# Output:
+#   $OUTPUT_DIR/{subject_id}/{subject_id}_gait_analysis.json
+#   $OUTPUT_DIR/{subject_id}/batch_log.txt
+# ============================================================
+
+# --- Configuration ---
+PROJECT_DIRECTORY=/lstr/sahara/zwlab/sp/GaitCycleDetection
+PYTHON_VENV="$PROJECT_DIRECTORY/gait_env/bin/activate"
+INPUT_DIR="$PROJECT_DIRECTORY/input"
+OUTPUT_DIR="$PROJECT_DIRECTORY/output"
+BATCH_SCRIPT="$PROJECT_DIRECTORY/batch_run.py"
+PYTHON="python3.9"
+FPS=30.0
+
+# Move to project directory
+cd "$PROJECT_DIRECTORY" || exit 1
+
+echo "============================================"
+echo "iGait Cycle Detection"
+echo "Job ID:    $PBS_JOBID"
+echo "CPUs:      $(nproc)"
+echo "Start:     $(date)"
+echo "Workdir:   $(pwd)"
+echo "============================================"
+
+# --- Environment Setup ---
+module load python/3.9 2>/dev/null || echo "WARNING: No python module found, using system python"
+
+source "$PYTHON_VENV" || {
+    echo "ERROR: Could not activate venv at $PYTHON_VENV"
+    exit 1
+}
+
+echo "Python: $(which $PYTHON)"
+echo "Version: $($PYTHON --version)"
+
+# Check dependencies
+$PYTHON -c "import numpy, pandas, scipy, matplotlib" || {
+    echo "ERROR: Missing dependencies. Run: pip install -r requirements.txt"
+    exit 1
+}
+
+# --- Run Batch Processing ---
+WORKERS=${NCPUS:-32}
+
+$PYTHON "$BATCH_SCRIPT" \
+    --input-dir "$INPUT_DIR" \
+    --output-dir "$OUTPUT_DIR" \
+    --input-layout flat \
+    --workers "$WORKERS" \
+    --screenshot-heel-strikes \
+    --fps "$FPS"
+
+EXIT_CODE=$?
+
+echo "============================================"
+echo "Finished:  $(date)"
+echo "Exit code: $EXIT_CODE"
+echo "============================================"
+
+exit $EXIT_CODE
