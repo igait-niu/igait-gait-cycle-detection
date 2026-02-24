@@ -554,7 +554,7 @@ def screenshot_heel_strikes(video_path, left_strikes, right_strikes, output_dir)
             print(f"  Warning: Could not read frame {frame_num}, skipping.")
             continue
 
-        filename = f'heel_strike_{side}_frame_{frame_num}.png'
+        filename = f'{frame_num}_{side}_heel_strike.png'
         filepath = os.path.join(screenshot_dir, filename)
         cv2.imwrite(filepath, frame)
         saved_paths.append(filepath)
