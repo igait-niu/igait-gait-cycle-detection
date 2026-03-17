@@ -103,8 +103,8 @@ def parse_args():
         help='Subject identifier for report titles (auto-detected from filename if omitted)'
     )
     parser.add_argument(
-        '--fps', type=float, default=30.0,
-        help='Video FPS for time calculations (default: 30.0)'
+        '--fps', type=float, default=None,
+        help='Video FPS override for time calculations (default: read from input JSON, fallback 30.0)'
     )
     parser.add_argument(
         '--plots', action='store_true', default=False,
@@ -153,6 +153,11 @@ def load_mediapipe_json(json_path):
     with open(json_path, 'r') as f:
         data = json.load(f)
 
+    metadata = {}
+    for key in ('video_filename', 'total_frames', 'label', 'fps', 'width', 'height'):
+        if key in data:
+            metadata[key] = data[key]
+
     total_frames = data.get('total_frames', 0)
     landmarks_list = data.get('landmarks_data', [])
 
@@ -170,7 +175,7 @@ def load_mediapipe_json(json_path):
     elif frame_lookup:
         frame_range = range(max(frame_lookup.keys()) + 1)
     else:
-        return pd.DataFrame(), landmarks_list
+        return pd.DataFrame(), landmarks_list, metadata
 
     kp_cols = [f'{name}_{ax}' for name in MAJOR_KEYPOINTS_TO_TRACK for ax in ['x', 'y', 'conf']]
     rows = []
@@ -227,7 +232,7 @@ def load_mediapipe_json(json_path):
 
         rows.append(row)
 
-    return pd.DataFrame(rows), landmarks_list
+    return pd.DataFrame(rows), landmarks_list, metadata
 
 # ==============================================================================
 # --- 5. Analysis Pipeline Functions (ported from Dr. Wang's code V3.15) ---
@@ -693,7 +698,7 @@ def generate_plots(df_for_analysis, cleaned_df, exclusion_frames, final_l_strike
 # ==============================================================================
 # --- 8. Main Analysis Function ---
 # ==============================================================================
-def process_video(raw_df, landmarks_data, subject_id, output_dir, fps, args):
+def process_video(raw_df, landmarks_data, metadata, subject_id, output_dir, fps, args):
     print(f"--- MediaPipe Gait Analysis (v5.0.0) ---")
     print(f"--- Subject: {subject_id} ---")
     print(f"--- Frames: {len(raw_df)}, FPS: {fps} ---\n")
@@ -801,6 +806,7 @@ def process_video(raw_df, landmarks_data, subject_id, output_dir, fps, args):
 
     # Step 7: Write output JSON
     output_data = {
+        'metadata': metadata,
         'gait_cycles': gait_cycles,
         'landmark_data': landmarks_data,
     }
@@ -842,14 +848,23 @@ if __name__ == '__main__':
 
     # Load data
     print(f"Loading landmarks from: {args.landmarks_json}")
-    raw_df, landmarks_data = load_mediapipe_json(args.landmarks_json)
+    raw_df, landmarks_data, metadata = load_mediapipe_json(args.landmarks_json)
     if raw_df.empty:
         print("ERROR: No data loaded from landmarks file.")
         sys.exit(1)
     print(f"Loaded {len(raw_df)} frames with {len(landmarks_data)} landmark entries.\n")
 
+    # Resolve fps: CLI override > input JSON > 30.0 default
+    if args.fps is not None:
+        fps = args.fps
+    elif 'fps' in metadata:
+        fps = float(metadata['fps'])
+    else:
+        fps = 30.0
+    metadata['fps'] = fps
+
     # Run analysis
-    result = process_video(raw_df, landmarks_data, subject_id, args.output_dir, args.fps, args)
+    result = process_video(raw_df, landmarks_data, metadata, subject_id, args.output_dir, fps, args)
     if result is None:
         print("\nAnalysis failed.")
         sys.exit(1)
